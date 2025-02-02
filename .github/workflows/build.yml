@@ -1,0 +1,14 @@
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: cmake
+      run: cmake CMakeLists.txt
+      run: cmake -S . -B build
+
+    - name: make
+      working-directory: build
+      run: make
+
+    - name: run
+      working-directory: build
+      run: ./dungeon_crawler
