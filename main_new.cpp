@@ -1,17 +1,16 @@
 #include <iostream>
 #include <memory>
 #include <vector>
-#include <exception>
 
 
 struct constraint_violated : public std::runtime_error
 {
-	constraint_violated(const std::string &what, const std::string &msg, const std::string &where) : 
-		std::runtime_error("\n\tfailed: " + what + "\n\tmeans:  " + msg +  "\n\tat:     " + where) {}
+	constraint_violated(const std::string &what, const std::string &msg, const std::string &where, int line) : 
+		std::runtime_error("\n\tfailed: " + what + "\n\tmeans:  " + msg +  "\n\tat:     " + where + "\n\tline:   " + std::to_string(line)) {}
 };
 
 
-#define assert(b, what) if (!static_cast<bool>((b))) throw constraint_violated(#b, ((what)), __func__)
+#define assert(b, what) if (!static_cast<bool>((b))) throw constraint_violated(#b, ((what)), __func__, __LINE__)
 
 
 struct game_state;
@@ -30,10 +29,69 @@ struct card
 };
 
 
+enum tag_type {
+	DEAD,
+	POISON,
+};
+
+
+struct counter
+{
+	tag_type _type = DEAD;
+	int _value = 0;
+};
+
+
+struct tags
+{
+	std::vector<std::shared_ptr<const counter>> _counters;
+
+	int count() const {
+		return _counters.size();
+	}
+	const counter &at(int idx) const {
+		assert(0 <= idx && idx < count(), "bad index");
+		return *_counters[idx];
+	}
+	int counter_cr(tag_type type) const {
+		for (const auto &counter : _counters)
+			if (counter->_type == type) return counter->_value;
+		return 0;
+	}
+	int counter_bump(tag_type type, int incdec) {
+		assert(incdec, "use counter_cr to access value without detach");
+		for (auto &iter : _counters) {
+			if (iter->_type != type) continue;
+			auto *_tmp = new counter(*iter);
+			_tmp->_value += incdec;
+			iter = std::shared_ptr<const counter>(_tmp);
+			return iter->_value;
+		}
+		auto *_tmp = new counter{};
+		_tmp->_type = type; 
+		_tmp->_value = incdec;
+		_counters.emplace_back(_tmp);
+		return incdec;
+	}
+};
+
+
 struct unit
 {
 	int _hp = 100;
 	int _power = 5;
+	std::shared_ptr<const tags> _tags;
+
+	const tags &tags_cr() const {
+		assert(_tags, "can't be nullptr");
+		return *_tags;
+	}
+	tags &tags_detach() {
+		assert(_tags, "can't be nullptr");
+		auto *_tmp = new tags(*_tags);
+		_tags = std::shared_ptr<const tags>(_tmp);
+		return *_tmp;
+	}
 };
 
 
@@ -236,6 +294,18 @@ struct action_play_top_card : action
 };
 
 
+struct action_apply_poison : action
+{
+	void run(game_state &game) const override {
+		game
+			.team_detach(team::ENEMY)
+			.unit_detach(team::LEADER)
+			.tags_detach()
+			.counter_bump(POISON, 10);
+	}
+};
+
+
 struct random_counter : rng
 {
 	explicit random_counter(int seed) { set_seed(seed); }
@@ -257,6 +327,7 @@ private:
 
 void draw_card() {
 	game_state game;
+
 	game._rng = std::make_shared<const random_counter>(42);
 
 	auto c1 = std::make_shared<card>();
@@ -276,14 +347,13 @@ void draw_card() {
 	shuffle.run(game2);
 
 	action_draw draw;
-	draw.run(game2);
+	draw.run(game);
 
 	assert(game._hand != game2._hand, "hand was detached!");
 	assert(game._deck != game2._deck, "deck was detached!");
 	assert(game2._deck->_cards == (std::vector<std::shared_ptr<const card>>{ c3, c2 }), "");
 	assert(game2._hand->_cards == std::vector<std::shared_ptr<const card>>{ c1 }, "");
 }
-
 
 
 int main() {
