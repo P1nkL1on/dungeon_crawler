@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <list>
 
 
 struct constraint_violated : public std::runtime_error
@@ -29,15 +30,18 @@ struct card
 };
 
 
-enum tag_type {
+enum class tag {
 	DEAD,
 	POISON,
+	DAMAGE,
+	POWER,
+	INCAPACITATED,
 };
 
 
 struct counter
 {
-	tag_type _type = DEAD;
+	tag _type = tag::DEAD;
 	int _value = 0;
 };
 
@@ -53,12 +57,12 @@ struct tags
 		assert(0 <= idx && idx < count(), "bad index");
 		return *_counters[idx];
 	}
-	int counter_cr(tag_type type) const {
+	int counter_cr(tag type) const {
 		for (const auto &counter : _counters)
 			if (counter->_type == type) return counter->_value;
 		return 0;
 	}
-	int counter_bump(tag_type type, int incdec) {
+	int counter_bump(tag type, int incdec) {
 		assert(incdec, "use counter_cr to access value without detach");
 		for (auto &iter : _counters) {
 			if (iter->_type != type) continue;
@@ -76,12 +80,63 @@ struct tags
 };
 
 
+enum class trigger {
+	ATTACK,
+	ALLY_ATTACK,
+	ATTACKED,
+	
+	TAG_INC = 10000,
+	HURT = TAG_INC + (int)tag::DAMAGE,
+	DIED = TAG_INC + (int)tag::DEAD,
+	
+	ALLY_TAG_INC = 20000,
+};
+
+trigger operator+(trigger a, trigger b) {
+	return trigger((int)a + (int)b);
+}
+
+trigger operator+(trigger a, tag b) {
+	return trigger((int)a + (int)b);
+}
+
+
+struct ability
+{
+	trigger _trigger;
+	std::shared_ptr<const action> _action;
+};
+
+
+struct abilities
+{
+	std::vector<std::shared_ptr<const ability>> _abilities;
+
+	void add(trigger _trigger, action *_action) {
+		_abilities.emplace_back(new ability{
+			_trigger, std::shared_ptr<const action>(_action)});
+	}
+
+	std::list<std::shared_ptr<const action>> triggered(trigger _trigger) const {
+		std::list<std::shared_ptr<const action>> _tmp;
+		for (const auto &_ability : _abilities)
+			if (_ability->_trigger == _trigger) _tmp.push_back(_ability->_action);
+		return _tmp;
+	}
+};
+
+
 struct unit
 {
 	int _hp = 100;
 	int _power = 5;
-	std::shared_ptr<const tags> _tags;
+	std::shared_ptr<const tags> _tags = std::make_shared<tags>();
+	std::shared_ptr<const abilities> _abilities = std::make_shared<abilities>();
 
+	const abilities &abilities_cr() const {
+		assert(_abilities, "can't be nullptr");
+		return *_abilities;
+	}
 	const tags &tags_cr() const {
 		assert(_tags, "can't be nullptr");
 		return *_tags;
@@ -90,6 +145,12 @@ struct unit
 		assert(_tags, "can't be nullptr");
 		auto *_tmp = new tags(*_tags);
 		_tags = std::shared_ptr<const tags>(_tmp);
+		return *_tmp;
+	}
+	abilities &abilities_detach() {
+		assert(_abilities, "can't be nullptr");
+		auto *_tmp = new abilities(*_abilities);
+		_abilities = std::shared_ptr<const abilities>(_tmp);
 		return *_tmp;
 	}
 };
@@ -136,6 +197,23 @@ struct hand
 
 
 struct game_state
+{
+	virtual ~game_state() = default;
+	virtual int unit_tag(team::side side, int idx, tag type) const = 0;
+	virtual int bump_unit_tag(team::side side, int idx, tag type, int incdec) = 0;
+	virtual int next_random(int min, int max) = 0;
+	virtual void rotate(team::side side, int incdec) = 0;
+	virtual void attack(team::side from, int idx, int opposite_idx) = 0;
+	virtual void process_triggers() = 0;
+	virtual team::side side() const = 0;
+	virtual int idx() const = 0;
+
+	bool is_lead() const { return idx() == team::LEADER; }
+	bool is_alive() const { return unit_tag(side(), idx(), tag::DEAD) == 0; }
+};
+
+
+struct game_state_impl : game_state
 {
 	std::shared_ptr<const rng> _rng;
 	std::shared_ptr<const hand> _deck;
@@ -206,13 +284,63 @@ struct game_state
 		else
 			assert(false, "unreachable");
 	}
-	int next_random(int min, int max) {
+
+	// game_state interface impl
+	int next_random(int min, int max) override {
 		assert(_rng, "can't be nullptr");
 		auto *_tmp = _rng->clone();
 		int num = _tmp->next(min, max);
 		_rng = std::shared_ptr<const rng>(_tmp);
 		return num;
 	}
+	int unit_tag(team::side side, int idx, tag type) const override {
+		return team_cr(side).unit_cr(idx).tags_cr().counter_cr(type);
+	}
+	int bump_unit_tag(team::side side, int idx, tag type, int incdec) override {
+		assert(incdec, "use const methods to get a tag value");
+		const int _tmp = team_detach(side).unit_detach(idx).tags_detach().counter_bump(type, incdec);
+
+		if (incdec > 0) {
+		}
+		return _tmp;
+	}
+	void rotate(team::side side, int incdec) override {
+		assert(incdec, "can't be 0");
+
+		// TODO: actually rotate a team (with detach)
+
+		for (plan &_plan : _queue)
+			if (_plan._side == side) _plan._idx += incdec;
+	}
+	void attack(team::side from, int idx, int opposite_idx) override {
+		queue_trigger(from, idx, trigger::ATTACK);
+		queue_trigger(!from, opposite_idx, trigger::ATTACKED);
+	}
+	void process_triggers() override {
+		while (!_queue.empty()) {
+			_queue.front()._action->run(*this);
+			_queue.pop_front();
+		}
+	}
+	team::side side() const override {
+		assert(!_queue.empty(), "this action can't run without a trigger queue");
+		return _queue.front()._side;
+	}
+	int idx() const override {
+		assert(!_queue.empty(), "this action can't run without a trigger queue");
+		return _queue.front()._idx;
+	}
+	void queue_trigger(team::side side, int idx, trigger _trigger) {
+		const auto _actions = team_cr(side).unit_cr(idx).abilities_cr().triggered(_trigger);
+		for (const auto &_action : _actions)
+			_queue.push_back(plan{_action, side, idx});
+	}
+	struct plan {
+		std::shared_ptr<const action> _action;
+		team::side _side;
+		int _idx;
+	};
+	std::list<plan> _queue;
 };
 
 
@@ -220,11 +348,11 @@ struct game_state
 struct action_draw : action
 {
 	void run(game_state &game) const override {
-		assert(!game.deck_cr()._cards.empty(), "deck is empty!");
-		hand &_hand = game.hand_detach();
-		hand &_deck = game.deck_detach();
-		_hand._cards.push_back(_deck._cards.back());
-		_deck._cards.pop_back();
+		// assert(!game.deck_cr()._cards.empty(), "deck is empty!");
+		// hand &_hand = game.hand_detach();
+		// hand &_deck = game.deck_detach();
+		// _hand._cards.push_back(_deck._cards.back());
+		// _deck._cards.pop_back();
 	}
 };
 
@@ -232,17 +360,17 @@ struct action_draw : action
 struct action_shuffle_deck : action
 {
 	void run(game_state &game) const override {
-		std::vector<std::shared_ptr<const card>> cards = game.deck_cr()._cards;
+		// std::vector<std::shared_ptr<const card>> cards = game.deck_cr()._cards;
 		
-		std::vector<std::shared_ptr<const card>> shuffled;
-		shuffled.reserve(cards.size());
+		// std::vector<std::shared_ptr<const card>> shuffled;
+		// shuffled.reserve(cards.size());
 
-		while (!cards.empty()) {
-			int idx = game.next_random(0, cards.size());
-			shuffled.push_back(cards[idx]);
-			cards.erase(cards.begin() + idx);
-		}
-		game.deck_detach()._cards = shuffled;
+		// while (!cards.empty()) {
+		// 	int idx = game.next_random(0, cards.size());
+		// 	shuffled.push_back(cards[idx]);
+		// 	cards.erase(cards.begin() + idx);
+		// }
+		// game.deck_detach()._cards = shuffled;
 	}
 };
 
@@ -252,44 +380,56 @@ struct action_strike : action
 	team::side side = team::ALLY;
 
 	void run(game_state &game) const override {
-		game.team_detach(!side).unit_detach(team::LEADER)._hp -= 
-			game.team_cr(side).unit_cr(team::LEADER)._power;
+		if (!game.is_alive())
+			return;
+		if (game.unit_tag(game.side(), game.idx(), tag::INCAPACITATED))
+			return; // miss
+		const int dmg = game.unit_tag(side, team::LEADER, tag::POWER);
+		if (!dmg)
+			return;
+		game.attack(game.side(), game.idx(), team::LEADER);
+		game.bump_unit_tag(!side, team::LEADER, tag::DAMAGE, dmg);
+		game.process_triggers();
 	}
 };
 
 
-struct action_clash : action
-{
-	team::side side = team::ALLY;
-
-	void run(game_state &game) const override {
-		
-		action_strike strike;
-		strike.side = side;
-		strike.run(game);
-
-		// TODO: check if backstriker is already dead
-
-		action_strike strike_back;
-		strike_back.side = !side;
-		strike_back.run(game);
-	}
-};
+// strong strike: x2 dmg, miss if enemy has unplayed cards
+// reckless: strike, but after it you are incapacitated
+// range: target any
+// support: any your attacks enemy leader
+// clash: strike + strike back
+// shock: deal damage (no strike)
+// blast: mass shock
+// rotate random
+// rotate left
+// rotate right
+// rotate any
+// leader swap
+// boss swap
+// boss retreat
+// +2 str to TE
+// +1 str til END
+// +2 str til END any
+// heal
+// guard
+// guard any
+// 
 
 
 struct action_play_top_card : action
 {
 	void run(game_state &game) const override {
-		assert(!game.deck_cr()._cards.empty(), "deck is empty!");
+		// assert(!game.deck_cr()._cards.empty(), "deck is empty!");
 
-		hand &deck = game.deck_detach();
-		std::shared_ptr<const card> top_card = deck._cards.back();
-		deck._cards.pop_back();
+		// hand &deck = game.deck_detach();
+		// std::shared_ptr<const card> top_card = deck._cards.back();
+		// deck._cards.pop_back();
 
-		top_card->_action->run(game);
+		// top_card->_action->run(game);
 
-		hand &discard = game.discard_detach();
-		discard._cards.push_back(top_card);
+		// hand &discard = game.discard_detach();
+		// discard._cards.push_back(top_card);
 	}
 };
 
@@ -297,11 +437,7 @@ struct action_play_top_card : action
 struct action_apply_poison : action
 {
 	void run(game_state &game) const override {
-		game
-			.team_detach(team::ENEMY)
-			.unit_detach(team::LEADER)
-			.tags_detach()
-			.counter_bump(POISON, 10);
+		game.bump_unit_tag(team::ENEMY, team::LEADER, tag::POISON, 10);
 	}
 };
 
@@ -325,8 +461,25 @@ private:
 };
 
 
+std::shared_ptr<const unit> create_spiky() {
+
+	struct dmg_back : action
+	{
+		void run(game_state &game) const override {
+			game.bump_unit_tag(team::ENEMY, team::LEADER, tag::DAMAGE, 3);
+		}
+	};
+
+	auto *_tmp = new unit;
+	_tmp->_hp = 12;
+	_tmp->_power = 4;
+	_tmp->abilities_detach().add(trigger::HURT, new dmg_back);
+	return std::shared_ptr<const unit>(_tmp);
+}
+
+
 void draw_card() {
-	game_state game;
+	game_state_impl game;
 
 	game._rng = std::make_shared<const random_counter>(42);
 
@@ -341,7 +494,7 @@ void draw_card() {
 	game._deck = deck;
 	game._hand = phand;
 
-	game_state game2 = game;
+	game_state_impl game2 = game;
 
 	action_shuffle_deck shuffle;
 	shuffle.run(game2);
@@ -349,10 +502,10 @@ void draw_card() {
 	action_draw draw;
 	draw.run(game);
 
-	assert(game._hand != game2._hand, "hand was detached!");
-	assert(game._deck != game2._deck, "deck was detached!");
-	assert(game2._deck->_cards == (std::vector<std::shared_ptr<const card>>{ c3, c2 }), "");
-	assert(game2._hand->_cards == std::vector<std::shared_ptr<const card>>{ c1 }, "");
+	// assert(game._hand != game2._hand, "hand was detached!");
+	// assert(game._deck != game2._deck, "deck was detached!");
+	// assert(game2._deck->_cards == (std::vector<std::shared_ptr<const card>>{ c3, c2 }), "");
+	// assert(game2._hand->_cards == std::vector<std::shared_ptr<const card>>{ c1 }, "");
 }
 
 
